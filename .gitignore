@@ -1,0 +1,16 @@
+checkpoints/
+data/raw/
+data/processed/
+__pycache__/
+*.pyc
+.eggs/
+*.egg-info/
+.env
+.venv/
+*.pt
+*.pkl
+*.faiss
+*.npy
+wandb/
+data/
+data/

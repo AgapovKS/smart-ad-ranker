@@ -1,0 +1,30 @@
+deepfm:
+  embed_dim: 16
+  hidden_dims: [400, 400, 400]
+  dropout: 0.2
+  epochs: 5
+  batch_size: 4096
+  lr: 0.001
+  weight_decay: 1.0e-6
+
+two_tower:
+  proj_dim: 128
+  embed_dim: 16
+  freeze_base_encoder: false
+  epochs: 5
+  batch_size: 256
+  lr_encoder: 3.0e-6    # 10x lower for pretrained weights
+  lr_head: 3.0e-5
+  temperature_init: 0.07
+  grad_clip: 1.0
+
+data:
+  val_days: 2
+  test_days: 1
+  max_vocab: 50000
+  min_freq: 10
+
+auction:
+  floor_price: 0.10
+  market_avg_cpm: 2.0
+  market_std_cpm: 1.0
