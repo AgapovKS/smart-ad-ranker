@@ -8,8 +8,6 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import faiss
-from transformers import AutoTokenizer, AutoModel
 from scipy.stats import lognorm
 from dataclasses import dataclass
 from huggingface_hub import hf_hub_download
@@ -17,26 +15,7 @@ import gradio as gr
 
 # ── Конфиг ────────────────────────────────────────────────────────────────────
 HF_REPO = "ksagapov/smart-ad-ranker-weights"
-MODEL_NAME = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 DEMO_MODE = False
-
-
-# ── Новая архитектура энкодера ────────────────────────────────────────────────
-class QueryEncoder(nn.Module):
-    def __init__(self, proj_dim=64):
-        super().__init__()
-        self.encoder = AutoModel.from_pretrained(MODEL_NAME)
-        hidden = self.encoder.config.hidden_size
-        self.proj = nn.Sequential(
-            nn.Linear(hidden, proj_dim),
-            nn.LayerNorm(proj_dim),
-        )
-
-    def forward(self, input_ids, attention_mask):
-        out = self.encoder(input_ids=input_ids, attention_mask=attention_mask)
-        mask = attention_mask.unsqueeze(-1).float()
-        pooled = (out.last_hidden_state * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
-        return F.normalize(self.proj(pooled), dim=-1)
 
 
 # ── Модели ────────────────────────────────────────────────────────────────────
@@ -133,10 +112,6 @@ print("Загружаю модели и индексы...")
 try:
     ckpt_path = hf_hub_download(repo_id=HF_REPO, filename="deepfm.pt")
     vocab_path = hf_hub_download(repo_id=HF_REPO, filename="vocab.pkl")
-    faiss_path = hf_hub_download(repo_id=HF_REPO, filename="ads_faiss.index")
-    tt_path = hf_hub_download(repo_id=HF_REPO, filename="two_tower.pt")
-    ad_map_path = hf_hub_download(repo_id=HF_REPO, filename="ad_map.pkl")
-
     ckpt = torch.load(ckpt_path, map_location="cpu")
     model = DeepFM(ckpt["field_dims"], embed_dim=16, hidden=(256, 256))
     model.load_state_dict(ckpt["state"], strict=False)
@@ -144,38 +119,19 @@ try:
     with open(vocab_path, "rb") as f:
         vocab = pickle.load(f)
 
-    with open(ad_map_path, "rb") as f:
-        ad_map = pickle.load(f)
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-
-    q_enc = QueryEncoder(proj_dim=64)
-    tt_ckpt = torch.load(tt_path, map_location="cpu")
-    q_enc.load_state_dict(tt_ckpt["q_enc"])
-    q_enc.eval()
-
     ALL_FEAT_COLS = ckpt["all_feat_cols"]
     calibrator = PlattCalibrator()
     model.eval()
-
-    index = faiss.read_index(faiss_path)
     print(f"Все ресурсы загружены. Признаков DeepFM: {len(ALL_FEAT_COLS)}")
 
 except Exception as e:
     print(f"Веса не найдены ({e}), запускаю в демо-режиме")
     DEMO_MODE = True
-    ad_map = []
     field_dims = [10] * 27
     ALL_FEAT_COLS = [f"f{i}" for i in range(27)]
     model = DeepFM(field_dims, embed_dim=16, hidden=(256, 256))
     calibrator = PlattCalibrator()
     model.eval()
-
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
-    q_enc = QueryEncoder(proj_dim=64)
-    q_enc.eval()
-
-    index = faiss.IndexFlatIP(64)
 
 
 # ── Вспомогательные функции математики и симуляции ───────────────────────────
@@ -406,76 +362,6 @@ def optimize_bid_ui(target_cpa, ctr, cvr, market_avg, market_std):
     )
 
 
-def format_ad_meta(meta):
-    if not isinstance(meta, dict):
-        return str(meta)
-
-    if meta.get("text"):
-        return meta["text"]
-
-    return (
-        f"site_category={meta.get('site_category')} | "
-        f"app_category={meta.get('app_category')} | "
-        f"site_domain={meta.get('site_domain')} | "
-        f"app_domain={meta.get('app_domain')} | "
-        f"banner_pos={meta.get('banner_pos')} | "
-        f"device_type={meta.get('device_type')} | "
-        f"device_model={meta.get('device_model')}"
-    )
-
-
-def search_ads_ui(query, k):
-    try:
-        k = int(k)
-
-        if index.ntotal == 0 or len(ad_map) == 0:
-            return "## Результаты поиска\n\nИндекс или ad_map не загружены."
-
-        k = min(k, index.ntotal)
-
-        enc = tokenizer(
-            [query],
-            padding=True,
-            truncation=True,
-            max_length=32,
-            return_tensors="pt"
-        )
-
-        with torch.no_grad():
-            query_vector = q_enc(
-                enc["input_ids"],
-                enc["attention_mask"]
-            ).cpu().numpy().astype("float32")
-
-        distances, indices = index.search(query_vector, k)
-
-        results = []
-        for i, idx in enumerate(indices[0]):
-            if idx < 0 or idx >= len(ad_map):
-                continue
-
-            meta = ad_map[idx]
-            ad_text = format_ad_meta(meta)
-
-            results.append(
-                f"Позиция {i+1} (Индекс в FAISS: {idx}) | "
-                f"Сходство: {distances[0][i]:.4f}\n"
-                f"Текст баннера: {ad_text}"
-            )
-
-        if not results:
-            return "## Результаты поиска\n\nНичего не найдено."
-
-        note = ""
-        if DEMO_MODE:
-            note = "\n\n> Внимание: демо-режим, индекс и ad_map загружены не были."
-
-        return "## Результаты поиска\n\n" + "\n\n---\n\n".join(results) + note
-
-    except Exception as e:
-        return f"Ошибка поиска: {str(e)}"
-
-
 # ── Построение интерфейса ─────────────────────────────────────────────────────
 with gr.Blocks(
     title="Smart Ad Ranker",
@@ -485,7 +371,7 @@ with gr.Blocks(
 
     gr.Markdown(
         "# Smart Ad Ranker\n"
-        "CTR-предсказание, подбор похожих объявлений, RTB-аукцион, оптимизация ставок\n\n"
+        "CTR-предсказание, RTB-аукцион, оптимизация ставок\n\n"
         "> Pet-проект: DeepFM + Platt Scaling на датасете Avazu (40M показов mobile рекламы)"
     )
 
@@ -512,40 +398,6 @@ with gr.Blocks(
 
         ctr_btn.click(predict_ctr_ui, inputs=[bp, dt, hod, wk], outputs=ctr_out)
 
-    with gr.Tab("Подбор похожих объявлений (FAISS)"):
-        gr.Markdown(
-            "Подбор похожих объявлений по контексту показа. "
-            "Это retrieval по признакам рекламы и устройства, а не поиск по полным текстам объявлений."
-        )
-        gr.Markdown(
-            """
-Примеры запросов:
-- mobile users
-- desktop traffic
-- gaming apps
-- finance category
-- tablet users
-"""
-        )
-
-        with gr.Row():
-            with gr.Column(scale=1):
-                search_query = gr.Textbox(
-                    label="Запрос",
-                    placeholder="Например: mobile users, gaming apps, desktop traffic"
-                )
-                k_candidates = gr.Slider(
-                    minimum=1,
-                    maximum=5,
-                    step=1,
-                    value=3,
-                    label="Количество кандидатов (K)",
-                )
-                search_btn = gr.Button("Найти баннеры", variant="primary")
-            with gr.Column(scale=1):
-                search_out = gr.Markdown("*Введите запрос и нажмите кнопку*")
-
-        search_btn.click(search_ads_ui, inputs=[search_query, k_candidates], outputs=search_out)
 
     with gr.Tab("Auction Simulator"):
         gr.Markdown("Запусти RTB-аукцион и посмотри, как расходуется бюджет против конкурентов.")
